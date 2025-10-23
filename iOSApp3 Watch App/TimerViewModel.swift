@@ -17,10 +17,18 @@ final class TimerViewModel: ObservableObject {
     // MARK: - Published UI State
     @Published var isRunning: Bool = false
     @Published var remainingSeconds: Int = 0
+    @Published var totalSeconds: Int = 0                  // <— for progress ring
     @Published var selectedPreset: Preset? = nil
+    @Published var completedAt: Date? = nil               // <— set on (round) completion
+
+    // New features
+    @Published var roundsTotal: Int = 1
+    @Published var currentRound: Int = 1
+    @Published var halfwayEnabled: Bool = false
 
     // MARK: - Private
     private var ticker: AnyCancellable?
+    private var halfwayFired: Bool = false
 
     // MARK: - Presets
     let presets: [Preset] = [
@@ -34,18 +42,22 @@ final class TimerViewModel: ObservableObject {
     /// Set a new timer duration. Stops any running timer first.
     func setTimer(seconds: Int, label: String? = nil) {
         stop()
-        remainingSeconds = max(0, seconds)
+        let clamped = max(0, seconds)
+        totalSeconds = clamped
+        remainingSeconds = clamped
         if let label = label {
-            selectedPreset = Preset(name: label, seconds: seconds)
+            selectedPreset = Preset(name: label, seconds: clamped)
         } else {
             selectedPreset = nil
         }
+        currentRound = 1
+        halfwayFired = false
+        completedAt = nil
     }
 
     /// Start ticking once per second if there is time remaining.
     func start() {
-        guard remainingSeconds > 0 else { return }
-        guard !isRunning else { return }
+        guard remainingSeconds > 0, !isRunning else { return }
         isRunning = true
 
         ticker = Timer
@@ -68,9 +80,14 @@ final class TimerViewModel: ObservableObject {
         pause()
         if let preset = selectedPreset {
             remainingSeconds = preset.seconds
+            totalSeconds = preset.seconds
         } else {
             remainingSeconds = 0
+            totalSeconds = 0
         }
+        currentRound = 1
+        halfwayFired = false
+        completedAt = nil
     }
 
     /// Stop and clear the ticker (used internally).
@@ -80,16 +97,57 @@ final class TimerViewModel: ObservableObject {
         ticker = nil
     }
 
+    /// Nudge remaining time by +/- seconds. Keeps >= 0. If nudging up past total, expand total.
+    func nudge(seconds delta: Int) {
+        let newRemaining = max(0, remainingSeconds + delta)
+        remainingSeconds = newRemaining
+        if newRemaining > totalSeconds { totalSeconds = newRemaining }
+        // If we nudged above halfway again, allow halfway alert to fire later.
+        if totalSeconds > 0, Double(remainingSeconds) / Double(totalSeconds) > 0.5 {
+            halfwayFired = false
+        }
+    }
+
+    // MARK: - Derived
+    /// 0...1 remaining progress (safe for 0 total)
+    var progressRemaining: Double {
+        guard totalSeconds > 0 else { return 0 }
+        return max(0, min(1, Double(remainingSeconds) / Double(totalSeconds)))
+    }
+
     // MARK: - Internal
     private func tick() {
         guard remainingSeconds > 0 else {
-            // Completed
-            stop()
-            // Haptic to notify the user on watch
-            WKInterfaceDevice.current().play(.success)
-            return
+            // A round has completed.
+            // Notify the View (for history + local notification) every round:
+            completedAt = Date()
+
+            if currentRound < roundsTotal {
+                // Prepare next round without stopping the ticker
+                currentRound += 1
+                remainingSeconds = totalSeconds
+                halfwayFired = false
+                WKInterfaceDevice.current().play(.start) // subtle ping to begin new round
+                return
+            } else {
+                // All rounds done — stop the timer
+                stop()
+                WKInterfaceDevice.current().play(.success)
+                return
+            }
         }
+
+        // Normal countdown
         remainingSeconds -= 1
+
+        // Halfway alert once per round
+        if halfwayEnabled, totalSeconds > 0 {
+            let half = totalSeconds / 2
+            if !halfwayFired, remainingSeconds == half {
+                halfwayFired = true
+                WKInterfaceDevice.current().play(.directionUp)
+            }
+        }
     }
 }
 
