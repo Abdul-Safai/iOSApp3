@@ -2,35 +2,52 @@ import Foundation
 import Combine
 import WatchKit
 
-/// A simple preset model for quick timer selections.
 struct Preset: Identifiable, Hashable {
     let id = UUID()
     let name: String
     let seconds: Int
 }
 
-/// ViewModel that owns timer state and logic.
-/// Uses Combine's `Timer.publish` to tick once per second on the main runloop.
+/// Summary model to present at the end
+struct WorkoutSummary: Identifiable, Equatable {
+    let id = UUID()
+    let date: Date
+    let presetName: String
+    let workSecondsPerRound: Int
+    let rounds: Int
+    let restSecondsPerGap: Int
+    var totalWorkSeconds: Int { workSecondsPerRound * rounds }
+    var totalRestSeconds: Int { max(0, rounds - 1) * restSecondsPerGap }
+    var totalSeconds: Int { totalWorkSeconds + totalRestSeconds }
+}
+
 @MainActor
 final class TimerViewModel: ObservableObject {
 
-    // MARK: - Published UI State
+    // MARK: - Published UI State (Work)
     @Published var isRunning: Bool = false
     @Published var remainingSeconds: Int = 0
-    @Published var totalSeconds: Int = 0                  // <— for progress ring
+    @Published var totalSeconds: Int = 0
     @Published var selectedPreset: Preset? = nil
-    @Published var completedAt: Date? = nil               // <— set on (round) completion
+    @Published var completedAt: Date? = nil   // fires at END of each WORK round
 
-    // New features
+    // Rounds + Halfway
     @Published var roundsTotal: Int = 1
     @Published var currentRound: Int = 1
     @Published var halfwayEnabled: Bool = false
+
+    // Rest state
+    @Published var restSecondsSetting: Int = 20
+    @Published var isResting: Bool = false
+    @Published var restRemaining: Int = 0
+
+    // NEW: Published summary when workout finishes
+    @Published var summary: WorkoutSummary? = nil
 
     // MARK: - Private
     private var ticker: AnyCancellable?
     private var halfwayFired: Bool = false
 
-    // MARK: - Presets
     let presets: [Preset] = [
         Preset(name: "20 sec", seconds: 20),
         Preset(name: "1 min",  seconds: 60),
@@ -38,46 +55,43 @@ final class TimerViewModel: ObservableObject {
         Preset(name: "10 min", seconds: 10 * 60)
     ]
 
-    // MARK: - Intent(s)
-    /// Set a new timer duration. Stops any running timer first.
+    // MARK: - Intents
     func setTimer(seconds: Int, label: String? = nil) {
         stop()
+        isResting = false
+        restRemaining = 0
+        summary = nil
+
         let clamped = max(0, seconds)
         totalSeconds = clamped
         remainingSeconds = clamped
-        if let label = label {
-            selectedPreset = Preset(name: label, seconds: clamped)
-        } else {
-            selectedPreset = nil
-        }
+        selectedPreset = label.map { Preset(name: $0, seconds: clamped) }
         currentRound = 1
         halfwayFired = false
         completedAt = nil
     }
 
-    /// Start ticking once per second if there is time remaining.
     func start() {
-        guard remainingSeconds > 0, !isRunning else { return }
+        guard (!isResting && remainingSeconds > 0) || (isResting && restRemaining > 0) else { return }
+        guard !isRunning else { return }
         isRunning = true
 
-        ticker = Timer
-            .publish(every: 1, on: .main, in: .common)
+        ticker = Timer.publish(every: 1, on: .main, in: .common)
             .autoconnect()
-            .sink { [weak self] _ in
-                self?.tick()
-            }
+            .sink { [weak self] _ in self?.tick() }
     }
 
-    /// Pause without clearing the current `remainingSeconds`.
     func pause() {
         isRunning = false
         ticker?.cancel()
         ticker = nil
     }
 
-    /// Reset back to the selected preset (or 0 if none).
     func reset() {
         pause()
+        isResting = false
+        restRemaining = 0
+        summary = nil
         if let preset = selectedPreset {
             remainingSeconds = preset.seconds
             totalSeconds = preset.seconds
@@ -90,78 +104,110 @@ final class TimerViewModel: ObservableObject {
         completedAt = nil
     }
 
-    /// Stop and clear the ticker (used internally).
     func stop() {
         isRunning = false
         ticker?.cancel()
         ticker = nil
     }
 
-    /// Nudge remaining time by +/- seconds. Keeps >= 0. If nudging up past total, expand total.
     func nudge(seconds delta: Int) {
+        guard !isResting else { return }
         let newRemaining = max(0, remainingSeconds + delta)
         remainingSeconds = newRemaining
         if newRemaining > totalSeconds { totalSeconds = newRemaining }
-        // If we nudged above halfway again, allow halfway alert to fire later.
         if totalSeconds > 0, Double(remainingSeconds) / Double(totalSeconds) > 0.5 {
             halfwayFired = false
         }
     }
 
     // MARK: - Derived
-    /// 0...1 remaining progress (safe for 0 total)
     var progressRemaining: Double {
-        guard totalSeconds > 0 else { return 0 }
-        return max(0, min(1, Double(remainingSeconds) / Double(totalSeconds)))
+        if isResting {
+            guard restSecondsSetting > 0 else { return 0 }
+            return max(0, min(1, Double(restRemaining) / Double(restSecondsSetting)))
+        } else {
+            guard totalSeconds > 0 else { return 0 }
+            return max(0, min(1, Double(remainingSeconds) / Double(totalSeconds)))
+        }
+    }
+
+    var displayIsZero: Bool {
+        isResting ? restRemaining == 0 : remainingSeconds == 0
     }
 
     // MARK: - Internal
     private func tick() {
+        if isResting {
+            tickRest()
+        } else {
+            tickWork()
+        }
+    }
+
+    private func tickRest() {
+        guard restRemaining > 0 else {
+            // Rest finished — begin next work round
+            isResting = false
+            currentRound += 1
+            if currentRound <= roundsTotal {
+                remainingSeconds = totalSeconds
+                halfwayFired = false
+                WKInterfaceDevice.current().play(.start)
+            } else {
+                // Safety stop
+                stop()
+            }
+            return
+        }
+        restRemaining -= 1
+    }
+
+    private func tickWork() {
         guard remainingSeconds > 0 else {
-            // A round has completed.
-            // Notify the View (for history + local notification) every round:
+            // Work round completed
             completedAt = Date()
 
             if currentRound < roundsTotal {
-                // Prepare next round without stopping the ticker
-                currentRound += 1
-                remainingSeconds = totalSeconds
-                halfwayFired = false
-                WKInterfaceDevice.current().play(.start) // subtle ping to begin new round
-                return
+                if restSecondsSetting > 0 {
+                    isResting = true
+                    restRemaining = restSecondsSetting
+                    WKInterfaceDevice.current().play(.notification)
+                    return
+                } else {
+                    // No rest — immediately start next round
+                    currentRound += 1
+                    remainingSeconds = totalSeconds
+                    halfwayFired = false
+                    WKInterfaceDevice.current().play(.start)
+                    return
+                }
             } else {
-                // All rounds done — stop the timer
+                // FINISHED ALL ROUNDS — produce summary and stop
                 stop()
                 WKInterfaceDevice.current().play(.success)
+
+                let name = selectedPreset?.name ?? "Custom"
+                summary = WorkoutSummary(
+                    date: Date(),
+                    presetName: name,
+                    workSecondsPerRound: totalSeconds,
+                    rounds: roundsTotal,
+                    restSecondsPerGap: restSecondsSetting
+                )
                 return
             }
         }
 
-        // Normal countdown
+        // Count down work
         remainingSeconds -= 1
 
-        // Halfway alert once per round
+        // Halfway alert once per WORK round
         if halfwayEnabled, totalSeconds > 0 {
             let half = totalSeconds / 2
             if !halfwayFired, remainingSeconds == half {
                 halfwayFired = true
                 WKInterfaceDevice.current().play(.directionUp)
             }
-        }
-    }
-}
-
-// MARK: - Small helpers
-extension Int {
-    /// Formats seconds as H:MM:SS when >= 1 hour, otherwise M:SS.
-    var asClockString: String {
-        let h = self / 3600
-        let m = (self % 3600) / 60
-        let s = self % 60
-        if h > 0 {
-            return String(format: "%d:%02d:%02d", h, m, s)
-        } else {
-            return String(format: "%d:%02d", m, s)
         }
     }
 }

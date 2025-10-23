@@ -2,7 +2,6 @@ import SwiftUI
 import WatchKit
 import UserNotifications
 
-// Unique history model name to avoid duplicates
 struct TimerHistoryItem: Identifiable, Codable {
     let id: UUID
     let when: Date
@@ -13,23 +12,19 @@ struct TimerHistoryItem: Identifiable, Codable {
 struct ContentView: View {
     @StateObject private var vm = TimerViewModel()
 
-    // Persist last custom H/M/S between launches (watch storage).
     @AppStorage("customHours")   private var customHours: Int = 0
     @AppStorage("customMinutes") private var customMinutes: Int = 0
     @AppStorage("customSeconds") private var customSeconds: Int = 20
 
-    // Persist simple history (JSON-encoded string)
     @AppStorage("historyV1") private var historyJSON: String = "[]"
-    // Persist user-saved presets (JSON of [PresetLite] from the previous message)
     @AppStorage("customPresetsV1") private var customPresetsJSON: String = "[]"
 
     @State private var showingCustom = false
 
-    // MARK: - Compact-aware sizing (fits 41/44/45/49mm)
+    // Compact layout helpers (same as your latest)
     private var bounds: CGRect { WKInterfaceDevice.current().screenBounds }
-    private var isSmallWatch: Bool { min(bounds.width, bounds.height) <= 170 } // 41/44mm
+    private var isSmallWatch: Bool { min(bounds.width, bounds.height) <= 170 }
     private var ringSize: CGFloat {
-        // Smaller factor for small watches to avoid top clipping
         let base = min(bounds.width, bounds.height)
         return base * (isSmallWatch ? 0.66 : 0.74)
     }
@@ -39,69 +34,71 @@ struct ContentView: View {
     private var topPad: CGFloat { isSmallWatch ? 2 : 8 }
 
     var body: some View {
-        // ScrollView prevents vertical clipping on smaller faces
         ScrollView {
             VStack(spacing: vStackSpacing) {
-
-                // PROGRESS RING + TIME
+                // Ring + time (unchanged, uses vm.isResting)
                 ZStack {
-                    Circle()
-                        .trim(from: 0, to: 1)
+                    Circle().trim(from: 0, to: 1)
                         .stroke(style: StrokeStyle(lineWidth: ringLine, lineCap: .round))
-                        .opacity(0.15)
+                        .opacity(0.12)
 
                     Circle()
                         .trim(from: 0, to: vm.progressRemaining)
                         .stroke(style: StrokeStyle(lineWidth: ringLine, lineCap: .round))
+                        .foregroundStyle(vm.isResting ? .gray : .accentColor)
                         .rotationEffect(.degrees(-90))
                         .animation(.linear(duration: 1), value: vm.progressRemaining)
 
                     VStack(spacing: isSmallWatch ? 2 : 4) {
-                        Text(vm.remainingSeconds.asClockString)
+                        if vm.roundsTotal > 1 {
+                            Text(vm.isResting ? "REST" : "WORK")
+                                .font(.caption2)
+                                .foregroundStyle(vm.isResting ? .secondary : .primary)
+                        }
+
+                        Text((vm.isResting ? vm.restRemaining : vm.remainingSeconds).asClockString)
                             .font(.system(size: timeFontSize, weight: .semibold, design: .rounded))
                             .monospacedDigit()
                             .minimumScaleFactor(0.6)
 
-                        // Round indicator (hidden for single-round)
-                        if vm.roundsTotal > 1 {
+                        if vm.roundsTotal > 1 && !vm.isResting {
                             Text("Round \(vm.currentRound) of \(vm.roundsTotal)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.8)
-                                .accessibilityLabel("Round \(vm.currentRound) of \(vm.roundsTotal)")
                         }
                     }
                 }
                 .frame(width: ringSize, height: ringSize)
                 .padding(.top, topPad)
 
-                // Quick adjust row
+                // Quick adjust (disabled during rest)
                 HStack(spacing: isSmallWatch ? 10 : 14) {
                     Button("-10s") { vm.nudge(seconds: -10) }
                         .buttonStyle(.bordered)
-                        .accessibilityLabel("Minus ten seconds")
+                        .disabled(vm.isResting)
                     Button("+10s") { vm.nudge(seconds: +10) }
                         .buttonStyle(.bordered)
-                        .accessibilityLabel("Plus ten seconds")
+                        .disabled(vm.isResting)
                 }
 
-                // Start / Pause / Reset
+                // Start/Pause/Reset
                 HStack(spacing: 8) {
                     if vm.isRunning {
                         Button("Pause") { vm.pause() }
                     } else {
                         Button("Start") { vm.start() }
-                            .disabled(vm.remainingSeconds == 0)
+                            .disabled(vm.displayIsZero)
                     }
                     Button("Reset") { vm.reset() }
-                        .disabled(vm.selectedPreset == nil && vm.remainingSeconds == 0)
+                        .disabled(vm.selectedPreset == nil && vm.remainingSeconds == 0 && !vm.isResting)
                 }
                 .buttonStyle(.borderedProminent)
 
                 Divider().padding(.vertical, isSmallWatch ? 1 : 2)
 
-                // Presets + Custom + Options + History
+                // List: Presets / Custom / Options / History  (unchanged from your latest)
                 List {
                     Section("Presets") {
                         ForEach(vm.presets) { preset in
@@ -110,11 +107,8 @@ struct ContentView: View {
                         if !customPresets.isEmpty {
                             ForEach(customPresets, id: \.id) { p in
                                 HStack {
-                                    Text(p.name)
-                                    Spacer()
-                                    Text(p.seconds.asClockString)
-                                        .foregroundStyle(.secondary)
-                                        .monospacedDigit()
+                                    Text(p.name); Spacer()
+                                    Text(p.seconds.asClockString).foregroundStyle(.secondary).monospacedDigit()
                                 }
                                 .contentShape(Rectangle())
                                 .onTapGesture {
@@ -127,18 +121,13 @@ struct ContentView: View {
                     }
 
                     Section {
-                        // Pick custom duration
                         HStack {
-                            Text("Custom…")
-                            Spacer()
-                            Text(totalCustomSeconds.asClockString)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
+                            Text("Custom…"); Spacer()
+                            Text(totalCustomSeconds.asClockString).foregroundStyle(.secondary).monospacedDigit()
                         }
                         .contentShape(Rectangle())
                         .onTapGesture { showingCustom = true }
 
-                        // Save current custom duration as a personal preset
                         Button {
                             let secs = totalCustomSeconds
                             let label = customLabel(for: secs)
@@ -146,11 +135,8 @@ struct ContentView: View {
                             WKInterfaceDevice.current().play(.click)
                         } label: {
                             HStack {
-                                Text("Save Custom as Preset")
-                                Spacer()
-                                Text(totalCustomSeconds.asClockString)
-                                    .foregroundStyle(.secondary)
-                                    .monospacedDigit()
+                                Text("Save Custom as Preset"); Spacer()
+                                Text(totalCustomSeconds.asClockString).foregroundStyle(.secondary).monospacedDigit()
                             }
                         }
                         .disabled(totalCustomSeconds == 0)
@@ -161,22 +147,22 @@ struct ContentView: View {
                             ForEach(1...10, id: \.self) { Text("\($0)") }
                         }
                         Toggle("Halfway Alert", isOn: $vm.halfwayEnabled)
+                        Picker("Rest", selection: $vm.restSecondsSetting) {
+                            ForEach([0,10,20,30,45,60], id: \.self) { s in
+                                Text(s == 0 ? "No Rest" : "\(s)s")
+                            }
+                        }
                     }
 
                     if !history.isEmpty {
                         Section("History") {
                             ForEach(history.prefix(5)) { item in
                                 HStack {
-                                    Text(item.label)
-                                    Spacer()
-                                    Text(item.seconds.asClockString)
-                                        .monospacedDigit()
-                                        .foregroundStyle(.secondary)
+                                    Text(item.label); Spacer()
+                                    Text(item.seconds.asClockString).monospacedDigit().foregroundStyle(.secondary)
                                 }
                             }
-                            Button(role: .destructive) {
-                                historyJSON = "[]"
-                            } label: { Text("Clear History") }
+                            Button(role: .destructive) { historyJSON = "[]"} label: { Text("Clear History") }
                         }
                     }
                 }
@@ -189,41 +175,42 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingCustom) {
             TimerCustomSheet(
-                hours: $customHours,
-                minutes: $customMinutes,
-                seconds: $customSeconds
+                hours: $customHours, minutes: $customMinutes, seconds: $customSeconds
             ) {
                 vm.setTimer(seconds: totalCustomSeconds, label: "Custom")
                 showingCustom = false
                 WKInterfaceDevice.current().play(.click)
             }
         }
-        // Ask once for notification permission
-        .onAppear {
-            requestNotificationPermissionIfNeeded()
-            // Default a preset so Start works immediately
-            if vm.remainingSeconds == 0 && vm.selectedPreset == nil {
-                if let first = vm.presets.first {
-                    vm.setTimer(seconds: first.seconds, label: first.name)
-                }
-            }
-        }
-        // When a (round) completes, save to history and notify
+        // 🔔 We keep notifications, but we no longer auto-save each round here.
         .onChange(of: vm.completedAt) { _, newValue in
             guard newValue != nil else { return }
-            appendHistory(label: vm.selectedPreset?.name ?? "Custom", seconds: vm.totalSeconds)
-            scheduleCompletionNotification(isFinalRound: vm.currentRound == vm.roundsTotal && vm.remainingSeconds == 0)
+            scheduleCompletionNotification(isFinalRound: vm.summary != nil)
+        }
+        // ✅ Present Summary when workout completes
+        .sheet(item: $vm.summary) { summary in
+            WorkoutSummaryView(
+                summary: summary,
+                onSave: {
+                    // Save one combined history item
+                    let label = makeSummaryLabel(summary)
+                    appendHistory(label: label, seconds: summary.totalSeconds)
+                }
+            )
+        }
+        .onAppear {
+            requestNotificationPermissionIfNeeded()
+            if vm.remainingSeconds == 0 && vm.selectedPreset == nil, let first = vm.presets.first {
+                vm.setTimer(seconds: first.seconds, label: first.name)
+            }
         }
     }
 
-    // MARK: - Rows
+    // MARK: - Helper Views / funcs
     private func presetRow(_ preset: Preset) -> some View {
         HStack {
-            Text(preset.name)
-            Spacer()
-            Text(preset.seconds.asClockString)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            Text(preset.name); Spacer()
+            Text(preset.seconds.asClockString).foregroundStyle(.secondary).monospacedDigit()
         }
         .contentShape(Rectangle())
         .onTapGesture {
@@ -236,7 +223,6 @@ struct ContentView: View {
         (customHours * 3600) + (customMinutes * 60) + customSeconds
     }
 
-    // MARK: - History helpers
     private var history: [TimerHistoryItem] {
         (try? JSONDecoder().decode([TimerHistoryItem].self, from: Data(historyJSON.utf8))) ?? []
     }
@@ -251,7 +237,6 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Local notifications (watch-friendly)
     private func requestNotificationPermissionIfNeeded() {
         UNUserNotificationCenter.current().getNotificationSettings { settings in
             guard settings.authorizationStatus == .notDetermined else { return }
@@ -262,19 +247,15 @@ struct ContentView: View {
     private func scheduleCompletionNotification(isFinalRound: Bool) {
         let content = UNMutableNotificationContent()
         content.title = isFinalRound ? "Workout Complete" : "Round Finished"
-        content.body = isFinalRound ? "Great job! All rounds are done." : "Nice! Start the next round."
+        content.body = isFinalRound ? "Great job! All rounds are done." : "Nice! Rest up or start next round."
         content.sound = .default
-
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger)
-        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: trigger))
     }
 
-    // MARK: - Custom preset storage (same helpers you already have)
+    // Custom Presets (same as before)
     private struct PresetLite: Identifiable, Codable {
-        let id: UUID
-        let name: String
-        let seconds: Int
+        let id: UUID; let name: String; let seconds: Int
     }
     private var customPresets: [PresetLite] {
         (try? JSONDecoder().decode([PresetLite].self, from: Data(customPresetsJSON.utf8))) ?? []
@@ -297,50 +278,63 @@ struct ContentView: View {
             customPresetsJSON = str
         }
     }
-    private func customLabel(for seconds: Int) -> String {
-        seconds.asClockString
+    private func customLabel(for seconds: Int) -> String { seconds.asClockString }
+
+    private func makeSummaryLabel(_ s: WorkoutSummary) -> String {
+        let restText = s.restSecondsPerGap > 0 ? " + rest \(s.restSecondsPerGap)s" : ""
+        return "\(s.presetName) ×\(s.rounds)\(restText)"
     }
 }
 
-// Unique name to avoid duplicates
-struct TimerCustomSheet: View {
-    @Binding var hours: Int
-    @Binding var minutes: Int
-    @Binding var seconds: Int
-    var onSet: () -> Void
-
-    private let hourRange = Array(0...5)
-    private let minuteRange = Array(0...59)
-    private let secondRange = Array(0...59)
+// MARK: - Summary Sheet UI
+private struct WorkoutSummaryView: View {
+    let summary: WorkoutSummary
+    var onSave: () -> Void
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         VStack(spacing: 8) {
-            Text("Custom Timer")
-                .font(.headline)
+            Text("Workout Summary").font(.headline)
 
-            HStack {
-                Picker("H", selection: $hours) { ForEach(hourRange, id: \.self) { Text("\($0)h") } }
-                    .frame(maxWidth: .infinity)
-                Picker("M", selection: $minutes) { ForEach(minuteRange, id: \.self) { Text("\($0)m") } }
-                    .frame(maxWidth: .infinity)
-                Picker("S", selection: $seconds) { ForEach(secondRange, id: \.self) { Text("\($0)s") } }
-                    .frame(maxWidth: .infinity)
+            Group {
+                row("Preset", summary.presetName)
+                row("Rounds", "\(summary.rounds)")
+                row("Work / round", summary.workSecondsPerRound.asClockString)
+                row("Total Work", summary.totalWorkSeconds.asClockString)
+                row("Total Rest", summary.totalRestSeconds.asClockString)
+                Divider().padding(.vertical, 2)
+                row("Total Time", summary.totalSeconds.asClockString)
             }
-            .labelsHidden()
 
-            Text(totalSeconds.asClockString)
-                .font(.title3)
-                .monospacedDigit()
-                .padding(.top, 2)
+            Button("Save to History") {
+                onSave()
+                dismiss()
+            }
+            .buttonStyle(.borderedProminent)
+            .padding(.top, 4)
 
-            Button("Set Timer") { onSet() }
-                .buttonStyle(.borderedProminent)
-                .padding(.top, 4)
+            Button("Done") { dismiss() }
+                .buttonStyle(.bordered)
         }
         .padding()
     }
 
-    private var totalSeconds: Int {
-        (hours * 3600) + (minutes * 60) + seconds
+    private func row(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value).monospacedDigit().foregroundStyle(.secondary)
+        }
+    }
+}
+
+// MARK: - Seconds → clock string
+extension Int {
+    var asClockString: String {
+        let h = self / 3600
+        let m = (self % 3600) / 60
+        let s = self % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%d:%02d", m, s)
     }
 }
